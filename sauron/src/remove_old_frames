@@ -1,0 +1,3 @@
+#/bin/sh
+rm /home/sauron/sauron/src/rgb_frames/*
+rm /home/sauron/sauron/src/lwir_frames/*

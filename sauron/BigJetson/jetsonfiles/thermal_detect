@@ -1,0 +1,102 @@
+from ultralytics import YOLO
+import cv2
+import glob
+import os
+
+# --- Configuration ---
+# Load model
+SAURON_MODEL_PATH = r"/home/sauron/Downloads/SAURON.pt"
+try:
+    SAURON = YOLO(SAURON_MODEL_PATH)
+    print(f"Successfully loaded model: {SAURON_MODEL_PATH}")
+except Exception as e:
+    print(f"Error loading YOLO model: {e}")
+    exit()
+
+# Directory containing the thermal (LWIR) images
+# Make sure this path points to the DIRECTORY, not a single file
+THERMAL_IMAGE_DIR = r"/media/sauron/SAURON/Out/"
+# Pattern to find thermal images (adjust if needed, e.g., "*.png")
+IMAGE_PATTERN = "*.jpg"
+
+# Confidence threshold 
+CONFIDENCE_THRESHOLD = 0.5 # Example: 50% confidence
+
+# --- Processing Logic ---
+
+search_path = os.path.join(THERMAL_IMAGE_DIR, IMAGE_PATTERN)
+print(f"Searching for thermal images in: {search_path}")
+
+# Process all images matching the pattern in the directory
+image_paths = glob.glob(search_path)
+
+if not image_paths:
+    print(f"No images found matching pattern '{IMAGE_PATTERN}' in directory '{THERMAL_IMAGE_DIR}'.")
+else:
+    print(f"Found {len(image_paths)} images to process.")
+
+for img_path in image_paths:
+    print(f"\nProcessing: {os.path.basename(img_path)}")
+
+    # Load the thermal image
+    # This 'image' variable will be used for both detection and drawing
+    image = cv2.imread(img_path)
+    if image is None:
+        print(f"  Error loading image: {img_path}")
+        continue # Skip to the next image
+
+    # Perform detection directly on the loaded thermal image
+    try:
+        results = SAURON(image, verbose=False) # Pass the loaded image array
+    except Exception as e:
+        print(f"  Error during detection: {e}")
+        continue # Skip to the next image
+
+    # Process results for this image
+    detections_drawn = 0
+    for result in results: # Typically one result for single image inference
+        # Get detection data (boxes, confidences, classes)
+        boxes = result.boxes.xyxy.cpu().numpy() # Format: [x1, y1, x2, y2]
+        confidences = result.boxes.conf.cpu().numpy()
+        class_indices = result.boxes.cls.cpu().numpy()
+
+        # Iterate through each detected box
+        for i, box in enumerate(boxes):
+            confidence = confidences[i]
+
+            # Apply confidence threshold
+            if confidence >= CONFIDENCE_THRESHOLD:
+                detections_drawn += 1
+                # Get original coordinates directly from the detection result
+                # No scaling or flipping needed
+                x1, y1, x2, y2 = map(int, box)
+
+                # Prepare the label text
+                class_id = int(class_indices[i])
+                label = f"{SAURON.names[class_id]}: {confidence:.2f}"
+
+                # Draw rectangle directly on the thermal 'image'
+                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2) # Green box, thickness 2
+
+                # Draw text label directly on the thermal 'image'
+                cv2.putText(image, label, (x1, y1 - 10), # Position text slightly above the box
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1) # Green text, size 0.5, thickness 1
+
+    if detections_drawn > 0:
+         print(f"  Drew {detections_drawn} detections passing threshold.")
+    else:
+         print("  No detections passed the threshold for this image.")
+
+    # Display the thermal image with detections drawn on it
+    cv2.imshow("SAURON Thermal Detection", image) # Show the modified thermal image
+
+    # Wait for a key press to advance to the next image (0 = wait indefinitely)
+    key = cv2.waitKey(1)
+    if key == 27:
+        print("Exiting.")
+        break 
+
+# --- Cleanup ---
+cv2.destroyAllWindows()
+print("\nProcessing complete.")
+

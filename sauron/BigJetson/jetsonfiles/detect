@@ -1,0 +1,351 @@
+from ultralytics import YOLO
+import cv2
+import glob
+import os
+import time
+import threading
+import queue
+from datetime import datetime
+import argparse
+
+class SauronDetectionSystem:
+    def __init__(self, model_path, thermal_source=None, rgb_source=None, confidence_threshold=0.25):
+        # Load model
+        self.model = YOLO(model_path)
+        self.thermal_source = thermal_source
+        self.rgb_source = rgb_source
+        self.confidence_threshold = confidence_threshold
+        
+        # Transformation parameters
+        self.HORIZONTAL_SCALE = 4096 / 640  # 6.4
+        self.VERTICAL_SCALE = 3000 / 512    # ≈5.859
+        self.TARGET_WIDTH = 4096
+        self.TARGET_HEIGHT = 3000
+        
+        # For storing detections
+        self.detection_history = []
+        
+        # For threaded processing
+        self.processing_queue = queue.Queue(maxsize=100)
+        self.display_queue = queue.Queue(maxsize=100)
+        self.running = False
+        
+    def set_sources(self, thermal_source, rgb_source=None):
+        """Set or update the image sources"""
+        self.thermal_source = thermal_source
+        self.rgb_source = rgb_source
+
+    def process_single_image(self, thermal_img_path, rgb_img_path=None):
+        """Process a single pair of thermal and RGB images"""
+        # Load thermal image and perform detection
+        results = self.model(thermal_img_path)
+        
+        # Load RGB image if provided, otherwise use thermal
+        if rgb_img_path and os.path.exists(rgb_img_path):
+            rgb_image = cv2.imread(rgb_img_path)
+        else:
+            rgb_image = cv2.imread(thermal_img_path)
+            
+        if rgb_image is None:
+            print(f"Error loading RGB image: {rgb_img_path}")
+            return None, []
+            
+        detections = []
+        annotated_image = rgb_image.copy()
+        
+        for result in results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confidences = result.boxes.conf.cpu().numpy()
+            class_indices = result.boxes.cls.cpu().numpy()
+            
+            for i, box in enumerate(boxes):
+                # Skip if confidence below threshold
+                if confidences[i] < self.confidence_threshold:
+                    continue
+                    
+                orig_x1, orig_y1, orig_x2, orig_y2 = map(int, box)
+                
+                # Transform coordinates from thermal to RGB
+                x1, y1, x2, y2 = self._transform_coordinates(
+                    orig_x1, orig_y1, orig_x2, orig_y2
+                )
+                
+                # Store detection information
+                class_name = self.model.names[int(class_indices[i])]
+                detection = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'class': class_name,
+                    'confidence': float(confidences[i]),
+                    'thermal_bbox': [orig_x1, orig_y1, orig_x2, orig_y2],
+                    'rgb_bbox': [x1, y1, x2, y2],
+                    'thermal_image': thermal_img_path,
+                    'rgb_image': rgb_img_path
+                }
+                detections.append(detection)
+                
+                # Draw on image
+                label = f"{class_name}: {confidences[i]:.2f}"
+                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(annotated_image, label, (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Store detections in history
+        if detections:
+            self.detection_history.extend(detections)
+            
+        return annotated_image, detections
+        
+    def _transform_coordinates(self, x1, y1, x2, y2):
+        """Transform coordinates from thermal to RGB space"""
+        # Scale coordinates
+        x1_scaled = int(x1 * self.HORIZONTAL_SCALE)
+        y1_scaled = int(y1 * self.VERTICAL_SCALE)
+        x2_scaled = int(x2 * self.HORIZONTAL_SCALE)
+        y2_scaled = int(y2 * self.VERTICAL_SCALE)
+        
+        # Invert horizontally (mirror across vertical axis)
+        x1_inv = self.TARGET_WIDTH - x2_scaled
+        x2_inv = self.TARGET_WIDTH - x1_scaled
+        
+        # Invert vertically (mirror across horizontal axis)
+        y1_inv = self.TARGET_HEIGHT - y2_scaled
+        y2_inv = self.TARGET_HEIGHT - y1_scaled
+        
+        return x1_inv, y1_inv, x2_inv, y2_inv
+    
+    def process_directory(self, thermal_dir, rgb_dir=None, output_dir=None):
+        """Process all images in a directory"""
+        thermal_files = sorted(glob.glob(os.path.join(thermal_dir, "*.jpg")))
+        results = []
+        
+        for thermal_file in thermal_files:
+            # Get corresponding RGB file if directory provided
+            rgb_file = None
+            if rgb_dir:
+                base_name = os.path.basename(thermal_file)
+                # Customize this logic based on how thermal and RGB images are paired
+                rgb_file = os.path.join(rgb_dir, base_name)
+                
+            annotated_img, detections = self.process_single_image(thermal_file, rgb_file)
+            
+            if annotated_img is not None and output_dir:
+                # Save annotated image
+                output_filename = os.path.join(output_dir, f"annotated_{os.path.basename(thermal_file)}")
+                cv2.imwrite(output_filename, annotated_img)
+                
+            results.append((thermal_file, detections))
+            
+            # Display if needed
+            if annotated_img is not None:
+                cv2.imshow("SAURON Detection", annotated_img)
+                key = cv2.waitKey(1)
+                if key == 27:  # ESC to exit
+                    break
+        
+        return results
+        
+    def process_video(self, thermal_video_path, rgb_video_path=None, output_path=None):
+        """Process video input"""
+        thermal_cap = cv2.VideoCapture(thermal_video_path)
+        rgb_cap = None
+        if rgb_video_path:
+            rgb_cap = cv2.VideoCapture(rgb_video_path)
+            
+        # Setup output video if needed
+        output_writer = None
+        if output_path:
+            fps = thermal_cap.get(cv2.CAP_PROP_FPS)
+            width = int(thermal_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(thermal_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            output_writer = cv2.VideoWriter(output_path, 
+                                           cv2.VideoWriter_fourcc(*'XVID'), 
+                                           fps, (width, height))
+        
+        frame_count = 0
+        start_time = time.time()
+        
+        while True:
+            thermal_ret, thermal_frame = thermal_cap.read()
+            
+            if not thermal_ret:
+                break
+                
+            rgb_frame = None
+            if rgb_cap:
+                rgb_ret, rgb_frame = rgb_cap.read()
+                if not rgb_ret:
+                    break
+            
+            # Save frames temporarily
+            thermal_temp = f"temp_thermal_{frame_count}.jpg"
+            cv2.imwrite(thermal_temp, thermal_frame)
+            
+            rgb_temp = None
+            if rgb_frame is not None:
+                rgb_temp = f"temp_rgb_{frame_count}.jpg"
+                cv2.imwrite(rgb_temp, rgb_frame)
+            
+            # Process frames
+            annotated_frame, detections = self.process_single_image(thermal_temp, rgb_temp)
+            
+            # Clean up temp files
+            os.remove(thermal_temp)
+            if rgb_temp:
+                os.remove(rgb_temp)
+            
+            # Display and save results
+            if annotated_frame is not None:
+                cv2.imshow("SAURON Video Detection", annotated_frame)
+                
+                if output_writer:
+                    output_writer.write(annotated_frame)
+                    
+            # Calculate FPS
+            frame_count += 1
+            if frame_count % 10 == 0:
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed
+                print(f"Processing at {fps:.2f} FPS")
+                
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC to exit
+                break
+                
+        # Release resources
+        thermal_cap.release()
+        if rgb_cap:
+            rgb_cap.release()
+        if output_writer:
+            output_writer.release()
+        cv2.destroyAllWindows()
+    
+    def start_live_processing(self):
+        """Start processing threads for live operation"""
+        self.running = True
+        
+        # Start worker threads
+        processing_thread = threading.Thread(target=self._processing_worker)
+        display_thread = threading.Thread(target=self._display_worker)
+        
+        processing_thread.daemon = True
+        display_thread.daemon = True
+        
+        processing_thread.start()
+        display_thread.start()
+        
+    def stop_live_processing(self):
+        """Stop all processing threads"""
+        self.running = False
+        
+    def _processing_worker(self):
+        """Worker thread for processing images"""
+        while self.running:
+            try:
+                # Get image from queue with timeout
+                thermal_img, rgb_img = self.processing_queue.get(timeout=1)
+                
+                # Process images
+                annotated_img, detections = self.process_single_image(thermal_img, rgb_img)
+                
+                # Put results in display queue
+                if annotated_img is not None:
+                    self.display_queue.put((annotated_img, detections))
+                    
+                self.processing_queue.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"Processing error: {str(e)}")
+    
+    def _display_worker(self):
+        """Worker thread for displaying results"""
+        while self.running:
+            try:
+                # Get processed results with timeout
+                annotated_img, detections = self.display_queue.get(timeout=1)
+                
+                # Display results
+                cv2.imshow("SAURON Live Detection", annotated_img)
+                key = cv2.waitKey(1)
+                
+                if key == 27:  # ESC key
+                    self.running = False
+                    
+                self.display_queue.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"Display error: {str(e)}")
+    
+    def save_detections(self, output_file):
+        """Save detection history to file"""
+        import json
+        
+        # Convert detection history to serializable format
+        serializable_history = []
+        for detection in self.detection_history:
+            # Create a copy of the detection dict
+            serialized = dict(detection)
+            # Convert any non-serializable types if needed
+            serializable_history.append(serialized)
+            
+        with open(output_file, 'w') as f:
+            json.dump(serializable_history, f, indent=4)
+            
+    def load_detections(self, input_file):
+        """Load detection history from file"""
+        import json
+        
+        with open(input_file, 'r') as f:
+            self.detection_history = json.load(f)
+
+def main():
+    parser = argparse.ArgumentParser(description='SAURON Detection System')
+    parser.add_argument('--model', type=str, default='/home/sauron/Downloads/SAURON',
+                        help='Path to YOLO model file')
+    parser.add_argument('--mode', type=str, choices=['single', 'directory', 'video', 'live'],
+                        default='single', help='Processing mode')
+    parser.add_argument('--thermal_source', type=str, required=True,
+                        help='Path to thermal image, directory, or video')
+    parser.add_argument('--rgb_source', type=str, default=None,
+                        help='Path to corresponding RGB image, directory, or video')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output path for results')
+    parser.add_argument('--confidence', type=float, default=0.25,
+                        help='Confidence threshold for detections')
+                        
+    args = parser.parse_args()
+    
+    # Initialize system
+    sauron = SauronDetectionSystem(args.model, confidence_threshold=args.confidence)
+    
+    # Process based on mode
+    if args.mode == 'single':
+        annotated_img, detections = sauron.process_single_image(args.thermal_source, args.rgb_source)
+        if annotated_img is not None:
+            cv2.imshow("SAURON Detection", annotated_img)
+            cv2.waitKey(0)
+            
+            if args.output:
+                cv2.imwrite(args.output, annotated_img)
+                
+    elif args.mode == 'directory':
+        sauron.process_directory(args.thermal_source, args.rgb_source, args.output)
+        
+    elif args.mode == 'video':
+        sauron.process_video(args.thermal_source, args.rgb_source, args.output)
+        
+    elif args.mode == 'live':
+        # Implementation depends on actual hardware setup
+        # This is a placeholder for a live camera implementation
+        print("Live mode not fully implemented - requires camera setup")
+        
+    # Save detection history if output specified
+    if args.output and sauron.detection_history:
+        detection_file = os.path.join(os.path.dirname(args.output), "detections.json")
+        sauron.save_detections(detection_file)
+        
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

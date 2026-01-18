@@ -1,5 +1,0 @@
-#/bin/sh
-
-ls ./lwir_frames/*.png | sort > lwir_list.txt
-
-awk '{print "file \047" $0 "\047"}' lwir_list.txt > lwir_files.txt

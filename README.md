@@ -87,6 +87,18 @@ python3 udp_thermal_server.py
 - WebSocket tunnel for browser compatibility
 - Thermal controls via UDP commands
 
+### Publish to GitHub Pages (LAN → web, no new server)
+
+1) Enable GitHub Pages for this repo and point it to the `docs/` folder.  
+2) On a gateway machine that can see the LAN server and the internet, run:
+   ```bash
+   cd /Users/ethansteider/Desktop/Capstone/Capstone/sauron
+   python3 src/github_pages_pusher.py --server http://<lan-ip>:8080
+   ```
+   This writes snapshots to `../docs/data/` (status JSON plus RGB/thermal JPEGs).  
+3) Commit and push the updated `docs/` folder to GitHub. The static site at `docs/index.html` will read those files and render them on Pages.  
+4) Automate with cron/systemd for periodic updates. No changes to `http_thermal_server.py` are needed.
+
 ## API Endpoints (HTTP Server)
 
 ### Camera Control

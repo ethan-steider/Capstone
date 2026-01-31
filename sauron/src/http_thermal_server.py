@@ -2,7 +2,10 @@ import os
 import time
 import threading
 import logging
+import subprocess
 from typing import Dict, Optional, Tuple
+from collections import deque
+from datetime import datetime, timedelta
 
 import cv2
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -44,6 +47,104 @@ FPS    = float(os.environ.get("CAM_FPS",   10))  # preview throttle per endpoint
 
 # Global FPS control (can be modified via API)
 current_fps = FPS
+auto_fps_enabled = False
+
+# Network monitoring
+class NetworkMonitor:
+    def __init__(self, max_samples=30):
+        self.latencies = deque(maxlen=max_samples)
+        self.frame_times = deque(maxlen=max_samples)
+        self.last_check = time.time()
+        self.lock = threading.Lock()
+    
+    def record_frame_time(self, size_bytes):
+        """Record frame transmission timing"""
+        with self.lock:
+            self.frame_times.append({
+                'timestamp': time.time(),
+                'size': size_bytes
+            })
+    
+    def measure_latency(self):
+        """Measure round-trip latency to server"""
+        try:
+            start = time.time()
+            # Use localhost ping (should be < 1ms)
+            result = subprocess.run(
+                ['ping', '-c', '1', 'localhost'],
+                capture_output=True,
+                timeout=2
+            )
+            latency = (time.time() - start) * 1000  # ms
+            with self.lock:
+                self.latencies.append(latency)
+            return latency
+        except:
+            return None
+    
+    def get_bandwidth_mbps(self):
+        """Calculate average bandwidth in Mbps"""
+        with self.lock:
+            if len(self.frame_times) < 2:
+                return None
+            
+            recent = list(self.frame_times)
+            if len(recent) < 2:
+                return None
+            
+            time_span = recent[-1]['timestamp'] - recent[0]['timestamp']
+            if time_span <= 0:
+                return None
+            
+            total_bytes = sum(f['size'] for f in recent)
+            mbps = (total_bytes * 8) / (time_span * 1_000_000)
+            return max(0.1, mbps)
+    
+    def get_avg_latency_ms(self):
+        """Get average latency in ms"""
+        with self.lock:
+            if not self.latencies:
+                return 0
+            return sum(self.latencies) / len(self.latencies)
+    
+    def get_network_quality(self):
+        """
+        Return network quality assessment:
+        'excellent' (>10 Mbps, <10ms), 'good' (>5 Mbps), 'fair' (>2 Mbps), 'poor'
+        """
+        mbps = self.get_bandwidth_mbps()
+        latency = self.get_avg_latency_ms()
+        
+        if mbps is None:
+            return 'unknown'
+        
+        if mbps > 10 and latency < 10:
+            return 'excellent'
+        elif mbps > 5 and latency < 20:
+            return 'good'
+        elif mbps > 2 and latency < 50:
+            return 'fair'
+        else:
+            return 'poor'
+    
+    def get_recommended_fps(self):
+        """Recommend FPS based on network quality"""
+        quality = self.get_network_quality()
+        mbps = self.get_bandwidth_mbps() or 0
+        
+        if quality == 'excellent':
+            return 30
+        elif quality == 'good':
+            return 20
+        elif quality == 'fair':
+            return 10
+        elif quality == 'poor':
+            return 5
+        else:
+            # Default fallback
+            return 10
+
+network_monitor = NetworkMonitor()
 
 SERIAL_PORT = os.environ.get(
     "THERMAL_SERIAL_PORT",
@@ -288,12 +389,14 @@ def mjpeg_generator(source: FrameGrabber, preview_fps: float):
                 time.sleep(0.01)
                 continue
 
-            yield (
+            frame_data = (
                 b'--frame\r\n'
                 b'Content-Type: image/jpeg\r\n\r\n' +
                 jpg.tobytes() +
                 b'\r\n'
             )
+            network_monitor.record_frame_time(len(jpg.tobytes()))
+            yield frame_data
             time.sleep(period)
     except GeneratorExit:
         # Client disconnected cleanly
@@ -828,10 +931,16 @@ INDEX_HTML = """
       <h1 style="margin:0;">Project Sauron</h1>
       <p class="subtitle" style="margin:4px 0 0;"></p>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span id="network-quality" style="font-size:12px;color:var(--muted);padding:4px 8px;border-radius:6px;background:rgba(255,255,255,0.05);">--</span>
+        <span id="network-stats" style="font-size:11px;color:var(--muted);" title="Bandwidth / Latency"></span>
+      </div>
+      <div style="height:20px;width:1px;background:rgba(255,255,255,0.1);"></div>
       <label style="font-size:12px;color:var(--muted);white-space:nowrap;">FPS:</label>
       <input type="range" id="fps-slider" min="1" max="60" value="10" style="width:100px;cursor:pointer;">
       <span id="fps-display" style="font-size:12px;color:var(--text);min-width:30px;text-align:right;">10</span>
+      <button id="auto-fps-btn" style="background:rgba(100,200,255,0.2);border:1px solid #64c8ff;color:#64c8ff;padding:6px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:600;">Auto FPS</button>
     </div>
     <button id="swap-feeds" style="background:linear-gradient(135deg, #ff8a3b, #ffb347); color:#0b0d12; border:none; padding:10px 14px; border-radius:10px; font-weight:700;">Swap feeds</button>
   </header>
@@ -1316,6 +1425,8 @@ INDEX_HTML = """
     // FPS Control Slider
     const fpsSlider = document.getElementById("fps-slider");
     const fpsDisplay = document.getElementById("fps-display");
+    const fpsDisplayBaseColor = getComputedStyle(fpsDisplay).color;
+    const autoFpsColor = '#4ade80';
     
     // Initialize FPS display on page load
     fetch("/api/fps")
@@ -1345,6 +1456,106 @@ INDEX_HTML = """
         console.error("FPS error:", err);
       }
     });
+
+    // Auto FPS button and Network monitoring
+    const autoFpsBtn = document.getElementById("auto-fps-btn");
+    const networkQuality = document.getElementById("network-quality");
+    const networkStats = document.getElementById("network-stats");
+    let autoFpsActive = false;
+    function setFpsDisplayColor(isAuto) {
+      fpsDisplay.style.color = isAuto ? autoFpsColor : fpsDisplayBaseColor;
+    }
+
+    async function updateNetworkStats() {
+      try {
+        const res = await fetch("/api/network");
+        const data = await res.json();
+        
+        // Update network quality display with color coding
+        const qualityColors = {
+          'excellent': '#4ade80',
+          'good': '#60a5fa',
+          'fair': '#fbbf24',
+          'poor': '#f87171',
+          'unknown': '#9ca3af'
+        };
+        
+        networkQuality.textContent = (data.quality || 'unknown').toUpperCase();
+        networkQuality.style.color = qualityColors[data.quality] || qualityColors['unknown'];
+        networkQuality.style.borderColor = qualityColors[data.quality] || qualityColors['unknown'];
+        networkQuality.style.borderWidth = '1px';
+        networkQuality.style.borderStyle = 'solid';
+        
+        // Update stats
+        const bandwidth = data.bandwidth_mbps ? data.bandwidth_mbps + ' Mbps' : '--';
+        const latency = data.latency_ms ? data.latency_ms + 'ms' : '--';
+        networkStats.textContent = `${bandwidth} / ${latency}`;
+        
+        // Update auto FPS display
+        if (autoFpsActive) {
+          const recommendedFps = Number(data.recommended_fps);
+          if (Number.isFinite(recommendedFps)) {
+            fpsSlider.value = recommendedFps;
+            fpsDisplay.textContent = Math.round(recommendedFps);
+          }
+          setFpsDisplayColor(true);
+        } else {
+          setFpsDisplayColor(false);
+        }
+      } catch (err) {
+        console.error("Failed to get network stats:", err);
+        networkQuality.textContent = 'ERROR';
+        networkQuality.style.color = '#ef4444';
+      }
+    }
+
+    autoFpsBtn.addEventListener("click", async () => {
+      try {
+        const enable = !autoFpsActive;
+        const res = await fetch("/api/auto-fps", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enable: enable })
+        });
+        
+        const data = await res.json();
+        autoFpsActive = data.auto_fps_enabled;
+        const autoFpsFromServer = Number(data.fps);
+        
+        if (autoFpsActive) {
+          if (Number.isFinite(autoFpsFromServer)) {
+            fpsSlider.value = autoFpsFromServer;
+            fpsDisplay.textContent = Math.round(autoFpsFromServer);
+          }
+          autoFpsBtn.style.background = 'rgba(74, 222, 128, 0.3)';
+          autoFpsBtn.style.borderColor = '#4ade80';
+          autoFpsBtn.style.color = '#4ade80';
+          autoFpsBtn.textContent = 'Auto FPS ON';
+          setFpsDisplayColor(true);
+          // Update network stats more frequently when auto FPS is on
+          updateNetworkStats();
+          const interval = setInterval(updateNetworkStats, 3000);
+          autoFpsBtn._interval = interval;
+        } else {
+          autoFpsBtn.style.background = 'rgba(100, 200, 255, 0.2)';
+          autoFpsBtn.style.borderColor = '#64c8ff';
+          autoFpsBtn.style.color = '#64c8ff';
+          autoFpsBtn.textContent = 'Auto FPS';
+          setFpsDisplayColor(false);
+          if (autoFpsBtn._interval) {
+            clearInterval(autoFpsBtn._interval);
+          }
+          autoFpsBtn._interval = null;
+        }
+      } catch (err) {
+        console.error("Auto FPS error:", err);
+      }
+    });
+
+    // Initial network stats update
+    updateNetworkStats();
+    // Periodic network stats update every 5 seconds
+    setInterval(updateNetworkStats, 5000);
 
     // Placeholder for SCD41; fill from a future endpoint if desired
     async function syncSensor() {
@@ -1626,17 +1837,74 @@ def api_get_fps():
 @app.route("/api/fps", methods=["POST"])
 def api_set_fps():
     """Set FPS on the fly"""
-    global current_fps
+    global current_fps, auto_fps_enabled
     payload = request.get_json(force=True, silent=True) or {}
     fps = payload.get("fps")
+    auto = payload.get("auto", False)
+    
+    if auto:
+        auto_fps_enabled = True
+        recommended = network_monitor.get_recommended_fps()
+        current_fps = float(recommended)
+        return jsonify({
+            "success": True,
+            "fps": current_fps,
+            "auto_enabled": True,
+            "reason": f"Auto FPS adjusted based on network quality"
+        })
+    
     if fps is None:
         return jsonify({"error": "fps is required"}), 400
+    
     try:
+        auto_fps_enabled = False
         fps = float(fps)
         current_fps = max(1.0, min(60.0, fps))
-        return jsonify({"success": True, "fps": current_fps})
+        return jsonify({"success": True, "fps": current_fps, "auto_enabled": False})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/network", methods=["GET"])
+def api_network_stats():
+    """Get network quality and statistics"""
+    return jsonify({
+        "quality": network_monitor.get_network_quality(),
+        "bandwidth_mbps": round(network_monitor.get_bandwidth_mbps() or 0, 2),
+        "latency_ms": round(network_monitor.get_avg_latency_ms(), 2),
+        "recommended_fps": network_monitor.get_recommended_fps(),
+        "auto_fps_enabled": auto_fps_enabled,
+        "current_fps": current_fps
+    })
+
+
+@app.route("/api/auto-fps", methods=["POST"])
+def api_auto_fps():
+    """Enable/disable auto FPS adjustment"""
+    global auto_fps_enabled, current_fps
+    payload = request.get_json(force=True, silent=True) or {}
+    enable = payload.get("enable", False)
+    
+    if enable:
+        auto_fps_enabled = True
+        # Start latency measurement thread
+        def measure_periodically():
+            while auto_fps_enabled:
+                network_monitor.measure_latency()
+                time.sleep(5)
+        
+        threading.Thread(target=measure_periodically, daemon=True).start()
+        recommended = network_monitor.get_recommended_fps()
+        current_fps = float(recommended)
+        return jsonify({
+            "success": True,
+            "auto_fps_enabled": True,
+            "fps": current_fps,
+            "quality": network_monitor.get_network_quality()
+        })
+    else:
+        auto_fps_enabled = False
+        return jsonify({"success": True, "auto_fps_enabled": False})
 
 
 @app.route("/api/camera/info")
@@ -1915,4 +2183,3 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=8080, threaded=True)
     finally:
         _stop_all()
-

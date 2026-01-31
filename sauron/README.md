@@ -1,4 +1,4 @@
-# Project Sauron 🔥
+# Project Sauron
 
 Real-time thermal and RGB camera control with advanced image processing and HM-TM5X thermal camera protocol support.
 
@@ -17,25 +17,25 @@ Project Sauron is a comprehensive thermal camera control system featuring:
 ## Features
 
 ### Video Streaming
-✅ Real-time MJPEG streaming (1-60 FPS adjustable on the fly)  
-✅ Dual camera support (RGB + Thermal)  
-✅ Frame rate control without restarting streams  
-✅ Modal preview with click-to-expand video  
+- Real-time MJPEG streaming (1-60 FPS adjustable on the fly)
+- Dual camera support (RGB + Thermal)
+- Frame rate control without restarting streams
+- Modal preview with click-to-expand video
 
 ### Thermal Camera Control
-✅ **Image Settings**: Brightness (0-255), Contrast (0-255), Detail (0-100)  
-✅ **Denoise**: Static (0-100), Dynamic (0-100)  
-✅ **Shutter Control**: Auto modes (0-3)  
-✅ **Flip Modes**: None, Horizontal, Vertical  
-✅ **Palette Selection**: 15+ color schemes  
-✅ **Settings Management**: Save and factory reset  
+- **Image Settings**: Brightness (0-255), Contrast (0-255), Detail (0-100)
+- **Denoise**: Static (0-100), Dynamic (0-100)
+- **Shutter Control**: Auto modes (0-3)
+- **Flip Modes**: None, Horizontal, Vertical
+- **Palette Selection**: 15+ color schemes
+- **Settings Management**: Save and factory reset
 
 ### User Interface
-✅ Draggable card layout (reorderable with drag-and-drop)  
-✅ Responsive grid layout  
-✅ Real-time slider controls with value display  
-✅ Serial port auto-detection and selection  
-✅ Dark theme optimized for low-light operation  
+- Draggable card layout (reorderable with drag-and-drop)
+- Responsive grid layout
+- Real-time slider controls with value display
+- Serial port auto-detection and selection
+- Dark theme optimized for low-light operation  
 
 ## Installation
 

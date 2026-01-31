@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Sauron - UDP Video Server</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    :root {
+      --bg: #0b0d12;
+      --panel: #111419;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #ff8a3b;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      padding: 20px;
+      line-height: 1.6;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+
+    h1 { font-size: 28px; margin-bottom: 8px; }
+    .subtitle { color: var(--muted); margin-bottom: 20px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+
+    .card {
+      background: linear-gradient(145deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 14px 40px rgba(0,0,0,0.35);
+    }
+
+    .card h2 { margin: 0; font-size: 20px; margin-bottom: 8px; }
+
+    .card header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .status {
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+
+    .status.running { background: rgba(34, 197, 94, 0.2); color: #86efac; }
+    .status.stopped { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+
+    .preview {
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 12px;
+      aspect-ratio: 4/3;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    button {
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: all 150ms ease;
+    }
+
+    button:hover {
+      background: rgba(255,255,255,0.12);
+      border-color: var(--accent);
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, var(--accent), #ffb347);
+      color: #0b0d12;
+      border: none;
+    }
+
+    button.primary:hover {
+      filter: brightness(1.1);
+    }
+
+    button.destructive {
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    button.destructive:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: #fca5a5;
+    }
+
+    .section {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .section h3 {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text);
+      margin-bottom: 12px;
+    }
+
+    .slider-group {
+      margin-bottom: 12px;
+    }
+
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+    input[type="range"] {
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: rgba(255,255,255,0.1);
+      outline: none;
+      -webkit-appearance: none;
+      cursor: pointer;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 8px rgba(255, 138, 59, 0.4);
+    }
+
+    input[type="range"]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      border: none;
+      box-shadow: 0 0 8px rgba(255, 138, 59, 0.4);
+    }
+
+    .value-display {
+      display: inline-block;
+      font-size: 12px;
+      color: var(--text);
+      padding: 2px 6px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 4px;
+      margin-left: 8px;
+    }
+
+    .status-log {
+      background: rgba(0,0,0,0.3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 11px;
+      font-family: 'Monaco', monospace;
+      color: var(--muted);
+      max-height: 100px;
+      overflow-y: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Project Sauron</h1>
+      <p class="subtitle">UDP Video Server</p>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- RGB Camera -->
+    <div class="card">
+      <header>
+        <h2>RGB Camera</h2>
+        <span class="status stopped" id="status-rgb">disconnected</span>
+      </header>
+      <div class="preview">
+        <canvas id="canvas-rgb"></canvas>
+      </div>
+      <div class="controls">
+        <button class="primary" id="btn-rgb-connect">Connect</button>
+        <button class="destructive" id="btn-rgb-disconnect">Disconnect</button>
+        <button id="btn-rgb-refresh">Refresh</button>
+      </div>
+    </div>
+
+    <!-- Thermal Camera -->
+    <div class="card">
+      <header>
+        <h2>Thermal Camera</h2>
+        <span class="status stopped" id="status-thermal">disconnected</span>
+      </header>
+      <div class="preview">
+        <canvas id="canvas-thermal"></canvas>
+      </div>
+      <div class="controls">
+        <button class="primary" id="btn-thermal-connect">Connect</button>
+        <button class="destructive" id="btn-thermal-disconnect">Disconnect</button>
+        <button id="btn-thermal-refresh">Refresh</button>
+      </div>
+
+      <div class="section">
+        <h3>Thermal Controls</h3>
+        
+        <div class="slider-group">
+          <label>Brightness <span class="value-display" id="brightness-val">128</span></label>
+          <input type="range" id="brightness-slider" min="0" max="255" value="128">
+        </div>
+
+        <div class="slider-group">
+          <label>Contrast <span class="value-display" id="contrast-val">128</span></label>
+          <input type="range" id="contrast-slider" min="0" max="255" value="128">
+        </div>
+
+        <div class="slider-group">
+          <label>Detail <span class="value-display" id="detail-val">128</span></label>
+          <input type="range" id="detail-slider" min="0" max="255" value="128">
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px;">
+          <button data-flip="0">Flip ⊘</button>
+          <button data-flip="2">Flip ↔</button>
+          <button data-flip="3">Flip ↕</button>
+        </div>
+
+        <div class="status-log" id="thermal-log">Waiting for commands...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ============================================================================
+    // UDP Frame Reassembly
+    // ============================================================================
+    class FrameAssembler {
+      constructor() {
+        this.frames = new Map(); // frameId -> {chunks: Map, totalChunks: number}
+        this.timeout = 5000; // 5 seconds
+      }
+
+      addChunk(frameId, chunkIdx, totalChunks, data) {
+        if (!this.frames.has(frameId)) {
+          this.frames.set(frameId, {
+            chunks: new Map(),
+            totalChunks: totalChunks,
+            timestamp: Date.now()
+          });
+        }
+
+        const frame = this.frames.get(frameId);
+        frame.chunks.set(chunkIdx, data);
+
+        // Check if complete
+        if (frame.chunks.size === totalChunks) {
+          const buffer = new Uint8Array(data.length * totalChunks);
+          let offset = 0;
+          for (let i = 0; i < totalChunks; i++) {
+            const chunk = frame.chunks.get(i);
+            buffer.set(chunk, offset);
+            offset += chunk.length;
+          }
+          this.frames.delete(frameId);
+          return buffer;
+        }
+
+        // Clean up old frames
+        for (const [id, frame] of this.frames) {
+          if (Date.now() - frame.timestamp > this.timeout) {
+            this.frames.delete(id);
+          }
+        }
+
+        return null;
+      }
+    }
+
+    // ============================================================================
+    // WebSocket Client for UDP Tunnel
+    // ============================================================================
+    class VideoClient {
+      constructor(camera, canvasId, statusId) {
+        this.camera = camera;
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.statusEl = document.getElementById(statusId);
+        this.ws = null;
+        this.assembler = new FrameAssembler();
+        this.connected = false;
+        this.setupCanvasSize();
+      }
+
+      setupCanvasSize() {
+        // Set canvas size based on camera (4:3 aspect ratio)
+        const rect = this.canvas.parentElement.getBoundingClientRect();
+        this.canvas.width = rect.width;
+        this.canvas.height = (rect.width * 3) / 4;
+      }
+
+      connect(wsUrl = 'ws://localhost:8081') {
+        if (this.connected) return;
+
+        this.ws = new WebSocket(wsUrl);
+        this.ws.binaryType = 'arraybuffer';
+
+        this.ws.onopen = () => {
+          console.log(`[${this.camera}] WebSocket connected`);
+          this.setStatus('connecting...', 'running');
+          
+          // Send registration
+          this.send({
+            cmd: 'register',
+            camera: this.camera
+          });
+        };
+
+        this.ws.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            // JSON message
+            const msg = JSON.parse(event.data);
+            this.handleMessage(msg);
+          } else {
+            // Binary video frame
+            this.handleVideoFrame(new Uint8Array(event.data));
+          }
+        };
+
+        this.ws.onerror = (err) => {
+          console.error(`[${this.camera}] WebSocket error:`, err);
+          this.setStatus('error', 'stopped');
+        };
+
+        this.ws.onclose = () => {
+          console.log(`[${this.camera}] WebSocket closed`);
+          this.setStatus('disconnected', 'stopped');
+          this.connected = false;
+        };
+      }
+
+      disconnect() {
+        if (this.ws) {
+          this.ws.close();
+          this.ws = null;
+          this.connected = false;
+        }
+        this.setStatus('disconnected', 'stopped');
+      }
+
+      send(data) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(data));
+        }
+      }
+
+      handleMessage(msg) {
+        if (msg.status === 'ok') {
+          this.connected = true;
+          this.setStatus('streaming', 'running');
+        }
+      }
+
+      handleVideoFrame(data) {
+        if (data.length < 8) return;
+
+        // Parse UDP header: frameId(4) + chunkIdx(2) + totalChunks(2)
+        const view = new DataView(data.buffer, data.byteOffset);
+        const frameId = view.getUint32(0, true);
+        const chunkIdx = view.getUint16(4, true);
+        const totalChunks = view.getUint16(6, true);
+        const chunkData = data.slice(8);
+
+        // Reassemble
+        const completeFrame = this.assembler.addChunk(
+          frameId,
+          chunkIdx,
+          totalChunks,
+          chunkData
+        );
+
+        if (completeFrame) {
+          this.renderFrame(completeFrame);
+        }
+      }
+
+      renderFrame(data) {
+        try {
+          const blob = new Blob([data], { type: 'image/jpeg' });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            this.ctx.drawImage(img, 0, 0, this.canvas.width, this.canvas.height);
+            URL.revokeObjectURL(url);
+          };
+          img.src = url;
+        } catch (e) {
+          console.error('Frame render error:', e);
+        }
+      }
+
+      setStatus(text, cssClass) {
+        this.statusEl.textContent = text;
+        this.statusEl.className = 'status ' + cssClass;
+      }
+
+      sendThermalCommand(cmd, value) {
+        this.send({
+          cmd: cmd,
+          camera: this.camera,
+          value: value
+        });
+      }
+    }
+
+    // ============================================================================
+    // Initialize Clients
+    // ============================================================================
+    const rgbClient = new VideoClient('rgb', 'canvas-rgb', 'status-rgb');
+    const thermalClient = new VideoClient('thermal', 'canvas-thermal', 'status-thermal');
+
+    // RGB Controls
+    document.getElementById('btn-rgb-connect').addEventListener('click', () => {
+      rgbClient.connect();
+    });
+    document.getElementById('btn-rgb-disconnect').addEventListener('click', () => {
+      rgbClient.disconnect();
+    });
+    document.getElementById('btn-rgb-refresh').addEventListener('click', () => {
+      rgbClient.disconnect();
+      setTimeout(() => rgbClient.connect(), 500);
+    });
+
+    // Thermal Controls
+    document.getElementById('btn-thermal-connect').addEventListener('click', () => {
+      thermalClient.connect();
+    });
+    document.getElementById('btn-thermal-disconnect').addEventListener('click', () => {
+      thermalClient.disconnect();
+    });
+    document.getElementById('btn-thermal-refresh').addEventListener('click', () => {
+      thermalClient.disconnect();
+      setTimeout(() => thermalClient.connect(), 500);
+    });
+
+    // Thermal Sliders
+    const thermalLog = document.getElementById('thermal-log');
+    
+    document.getElementById('brightness-slider').addEventListener('input', (e) => {
+      const value = parseInt(e.target.value);
+      document.getElementById('brightness-val').textContent = value;
+      thermalClient.sendThermalCommand('brightness', value);
+      addLog(`Brightness: ${value}`);
+    });
+
+    document.getElementById('contrast-slider').addEventListener('input', (e) => {
+      const value = parseInt(e.target.value);
+      document.getElementById('contrast-val').textContent = value;
+      thermalClient.sendThermalCommand('contrast', value);
+      addLog(`Contrast: ${value}`);
+    });
+
+    document.getElementById('detail-slider').addEventListener('input', (e) => {
+      const value = parseInt(e.target.value);
+      document.getElementById('detail-val').textContent = value;
+      thermalClient.sendThermalCommand('detail', value);
+      addLog(`Detail: ${value}`);
+    });
+
+    // Flip buttons
+    document.querySelectorAll('[data-flip]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const flipMode = parseInt(e.target.dataset.flip);
+        thermalClient.sendThermalCommand('flip', flipMode);
+        const modes = { 0: '⊘', 2: '↔', 3: '↕' };
+        addLog(`Flip: ${modes[flipMode]}`);
+      });
+    });
+
+    function addLog(msg) {
+      const timestamp = new Date().toLocaleTimeString();
+      thermalLog.textContent = `[${timestamp}] ${msg}\n${thermalLog.textContent}`;
+      thermalLog.textContent = thermalLog.textContent.split('\n').slice(0, 5).join('\n');
+    }
+
+    // Auto-connect on load
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        rgbClient.connect();
+        thermalClient.connect();
+      }, 500);
+    });
+  </script>
+</body>
+</html>

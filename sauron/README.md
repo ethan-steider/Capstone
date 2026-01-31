@@ -55,7 +55,7 @@ pip install opencv-python flask pyserial
 cd /Users/ethansteider/Desktop/Capstone/Capstone/sauron/src
 
 # Run the server
-python3 sliderserver.py
+python3 http_thermal_server.py
 ```
 
 ## Usage
@@ -63,7 +63,7 @@ python3 sliderserver.py
 ### HTTP Server (Recommended)
 
 ```bash
-python3 sliderserver.py
+python3 http_thermal_server.py
 # Open browser: http://localhost:8080
 ```
 
@@ -77,8 +77,8 @@ python3 sliderserver.py
 ### UDP Server (Low-Latency Alternative)
 
 ```bash
-python3 serverUDP.py
-# Open clientUDP.html in browser
+python3 udp_thermal_server.py
+# Open udp_client.html in browser
 # Connect to ws://localhost:8081
 ```
 
@@ -149,16 +149,16 @@ Run included test scripts to verify setup:
 
 ```bash
 # Test single camera
-python3 cameratest.py
+python3 test_single_camera.py
 
 # Test dual cameras (RGB + Thermal)
-python3 dualcameratest.py
+python3 test_dual_cameras.py
 
 # Test thermal serial communication
-python3 thermal_serial_test.py
+python3 test_thermal_serial.py
 
 # Test frame reading
-python3 test_read.py
+python3 test_frame_reading.py
 ```
 
 ## File Structure
@@ -168,14 +168,14 @@ sauron/
 ├── README.md                    # This file
 ├── STRUCTURE.md                 # Detailed file organization
 ├── src/
-│   ├── sliderserver.py         # Main HTTP server (69 KB)
-│   ├── serverUDP.py            # UDP server alternative (18 KB)
-│   ├── clientUDP.html          # UDP client UI (15 KB)
-│   ├── camapi.py               # Camera library (1.7 KB)
-│   ├── cameratest.py           # Camera test
-│   ├── dualcameratest.py       # Dual camera test
-│   ├── thermal_serial_test.py  # Serial communication test
-│   └── test_read.py            # Frame reading test
+│   ├── http_thermal_server.py  # Main HTTP server (69 KB)
+│   ├── udp_thermal_server.py   # UDP server alternative (18 KB)
+│   ├── udp_client.html         # UDP client UI (15 KB)
+│   ├── camera.py               # Camera library (1.7 KB)
+│   ├── test_single_camera.py   # Single camera test
+│   ├── test_dual_cameras.py    # Dual camera test
+│   ├── test_thermal_serial.py  # Serial communication test
+│   └── test_frame_reading.py   # Frame reading test
 ```
 
 ## Supported Cameras

@@ -6,7 +6,7 @@ Clean, organized repository for thermal camera control and video streaming.
 ## Current Files
 
 ### Core Servers
-- **`sliderserver.py`** - Main HTTP/Flask server
+- **`http_thermal_server.py`** - Main HTTP/Flask server
   - MJPEG video streaming (TCP/HTTP)
   - Thermal camera control (brightness, contrast, denoise, auto-shutter, flip)
   - Palette selection and settings management
@@ -14,43 +14,43 @@ Clean, organized repository for thermal camera control and video streaming.
   - Draggable UI cards with localStorage persistence
   - Factory reset and settings save functions
 
-- **`serverUDP.py`** - UDP-based video streaming server
+- **`udp_thermal_server.py`** - UDP-based video streaming server
   - Alternative low-latency streaming via UDP
   - WebSocket tunnel for browser compatibility
   - Frame fragmentation and reassembly
-  - Same thermal control capabilities as sliderserver
+  - Same thermal control capabilities as http_thermal_server
   - Dynamic FPS adjustment
 
-- **`clientUDP.html`** - Browser client for UDP server
+- **`udp_client.html`** - Browser client for UDP server
   - Canvas-based JPEG frame rendering
   - WebSocket connectivity
   - Thermal control sliders and buttons
   - Frame reassembly from UDP packets
 
 ### Core Libraries
-- **`camapi.py`** - Camera abstraction layer
+- **`camera.py`** - Camera abstraction layer
   - FrameGrabber class for video capture
   - Support for multiple camera devices
   - Frame format negotiation (MJPG/raw)
 
 ### Test Scripts
-- **`cameratest.py`** - Basic camera functionality test
-- **`dualcameratest.py`** - Test dual camera setup (RGB + Thermal)
-- **`thermal_serial_test.py`** - Thermal serial communication test
-- **`test_read.py`** - Frame reading test
+- **`test_single_camera.py`** - Basic camera functionality test
+- **`test_dual_cameras.py`** - Test dual camera setup (RGB + Thermal)
+- **`test_thermal_serial.py`** - Thermal serial communication test
+- **`test_frame_reading.py`** - Frame reading test
 
 ## Running the Servers
 
 ### HTTP Server (Recommended for local use)
 ```bash
-python3 sliderserver.py
+python3 http_thermal_server.py
 # Visit http://localhost:8080 in browser
 ```
 
 ### UDP Server (Low-latency streaming)
 ```bash
-python3 serverUDP.py
-# Open clientUDP.html in browser
+python3 udp_thermal_server.py
+# Open udp_client.html in browser
 # Connect to ws://localhost:8081
 ```
 

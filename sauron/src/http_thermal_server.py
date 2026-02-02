@@ -6,9 +6,10 @@ import subprocess
 from typing import Dict, Optional, Tuple
 from collections import deque
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import cv2
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file
 
 # Setup logging for diagnostics
 logging.basicConfig(level=logging.DEBUG)
@@ -48,6 +49,14 @@ FPS    = float(os.environ.get("CAM_FPS",   10))  # preview throttle per endpoint
 # Global FPS control (can be modified via API)
 current_fps = FPS
 auto_fps_enabled = False
+thermal_adjust_state: Dict[str, float] = {"brightness": 128, "contrast": 128, "detail": 1.0}
+
+def _reset_imaging_state_to_defaults():
+    thermal_adjust_state.update({
+        "brightness": DEFAULT_IMAGING["brightness"],
+        "contrast": DEFAULT_IMAGING["contrast"],
+        "detail": DEFAULT_IMAGING["detail"],
+    })
 
 # Network monitoring
 class NetworkMonitor:
@@ -205,6 +214,43 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", 60))
 
 app = Flask(__name__)
 
+# Flight session media folders (per server run)
+APP_ROOT = Path(__file__).resolve().parent
+_default_media_root = APP_ROOT / "flight_sessions"
+FLIGHT_MEDIA_ROOT = Path(os.environ.get("FLIGHT_MEDIA_ROOT") or _default_media_root)
+FLIGHT_SESSION_NAME = os.environ.get("FLIGHT_SESSION_NAME")
+
+def _init_flight_session_dirs():
+    """Create per-flight media folders for photos and videos."""
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base_slug = (FLIGHT_SESSION_NAME or f"flight_{timestamp}").strip().replace(" ", "_")
+    session_dir = FLIGHT_MEDIA_ROOT / base_slug
+
+    # Ensure uniqueness if a folder with the same name already exists
+    suffix = 1
+    while session_dir.exists():
+        session_dir = FLIGHT_MEDIA_ROOT / f"{base_slug}_{suffix}"
+        suffix += 1
+
+    photos_dir = session_dir / "photos"
+    videos_dir = session_dir / "videos"
+    for path in (photos_dir, videos_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"[SESSION] Media folders ready at {session_dir}")
+    return session_dir, photos_dir, videos_dir
+
+FLIGHT_SESSION_DIR, FLIGHT_PHOTOS_DIR, FLIGHT_VIDEOS_DIR = _init_flight_session_dirs()
+
+# Authoritative defaults for image controls
+DEFAULT_IMAGING = {
+    "brightness": 128,
+    "contrast": 128,
+    "static_denoise": 50,
+    "dynamic_denoise": 50,
+    "detail": 1.0,  # software preview factor (1.0 = neutral)
+    "auto_shutter": 0,
+}
 class FrameGrabber:
     """
     Threaded frame grabber for one V4L2/UVC/AVFoundation device.
@@ -315,9 +361,132 @@ class FrameGrabber:
         if restart or was_running:
             self.start()
 
-# Instantiate grabbers for both cameras
-rgb = FrameGrabber(CAMERA_INDEX, CAM_WIDTH, CAM_HEIGHT, request_mjpg=True)
-thermal = FrameGrabber(THERMAL_INDEX, THERMAL_WIDTH, THERMAL_HEIGHT, request_mjpg=True)
+# Instantiate grabbers for both cameras (swap defaults because devices enumerate reversed)
+rgb = FrameGrabber(THERMAL_INDEX, CAM_WIDTH, CAM_HEIGHT, request_mjpg=True)
+thermal = FrameGrabber(CAMERA_INDEX, THERMAL_WIDTH, THERMAL_HEIGHT, request_mjpg=True)
+
+
+class VideoRecorder:
+    """Lightweight recorder that writes frames from a grabber without stopping the stream."""
+    def __init__(self, camera_name: str, grabber: FrameGrabber):
+        self.camera_name = camera_name
+        self.grabber = grabber
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.running = False
+        self.output_path: Optional[Path] = None
+        self.writer = None
+
+    def start(self, fps: float = 10.0) -> Path:
+        with self.lock:
+            if self.running:
+                return self.output_path  # type: ignore
+
+            frame = self.grabber.read_latest()
+            if frame is None:
+                raise RuntimeError("no frame available to start recording")
+
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            self.output_path = FLIGHT_VIDEOS_DIR / f"{self.camera_name}_rec_{ts}.mp4"
+            self.writer = cv2.VideoWriter(str(self.output_path), fourcc, fps, (w, h))
+            if not self.writer.isOpened():
+                raise RuntimeError("failed to open video writer")
+
+            self.stop_event.clear()
+            self.running = True
+            self.thread = threading.Thread(target=self._loop, args=(fps,), daemon=True)
+            self.thread.start()
+            logger.info(f"[REC] Started recording {self.camera_name} to {self.output_path}")
+            return self.output_path
+
+    def _loop(self, fps: float):
+        period = 1.0 / max(1.0, fps)
+        consecutive_null = 0
+        try:
+            while not self.stop_event.is_set():
+                frame = self.grabber.read_latest()
+                if frame is None:
+                    consecutive_null += 1
+                    if consecutive_null > 30:  # ~3s at 10 FPS
+                        logger.error(f"[REC] No frames for {self.camera_name}; stopping recorder")
+                        break
+                    time.sleep(0.01)
+                    continue
+                consecutive_null = 0
+                try:
+                    # Write raw frames (no preview adjustments) to keep highest fidelity
+                    self.writer.write(frame)
+                except Exception as exc:
+                    logger.error(f"[REC] Write error for {self.camera_name}: {exc}")
+                    break
+                time.sleep(period)
+        finally:
+            self.stop_event.set()
+            self.running = False
+            self._finalize_writer()
+
+    def _finalize_writer(self):
+        try:
+            if self.writer is not None:
+                self.writer.release()
+        except Exception:
+            pass
+        self.writer = None
+
+    def stop(self):
+        with self.lock:
+            if not self.running:
+                self.stop_event.set()
+                self._finalize_writer()
+                return
+            self.stop_event.set()
+            if self.thread:
+                self.thread.join(timeout=2.0)
+            self.running = False
+            self.thread = None
+            self._finalize_writer()
+            logger.info(f"[REC] Stopped recording {self.camera_name}")
+
+    def status(self) -> Dict[str, object]:
+        return {
+            "running": self.running,
+            "path": str(self.output_path) if self.output_path else None,
+            "filename": self.output_path.name if self.output_path else None,
+        }
+
+
+recorders: Dict[str, VideoRecorder] = {
+    "rgb": VideoRecorder("rgb", rgb),
+    "thermal": VideoRecorder("thermal", thermal),
+}
+
+
+def _apply_thermal_adjustments(frame):
+    """Apply software brightness/contrast to thermal preview so slider changes are visible."""
+    if frame is None:
+        return None
+    try:
+        # Map slider 0-255 to alpha/beta: 128 == neutral
+        contrast = thermal_adjust_state.get("contrast", 128)
+        brightness = thermal_adjust_state.get("brightness", 128)
+        alpha = max(0.2, min(3.0, contrast / 128.0))
+        beta = max(-255, min(255, brightness - 128))
+        adjusted = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
+
+        # Software detail tweak (unsharp mask style)
+        detail_factor = float(thermal_adjust_state.get("detail", 1.0))
+        if abs(detail_factor - 1.0) > 0.01:
+            blurred = cv2.GaussianBlur(adjusted, (0, 0), sigmaX=1.0)
+            # detail_factor > 1 sharpens, < 1 softens slightly
+            adjusted = cv2.addWeighted(adjusted, detail_factor, blurred, -(detail_factor - 1.0), 0)
+
+        return adjusted
+    except Exception as exc:
+        logger.warning(f"[THERMAL] Adjustment failed: {exc}")
+        return frame
 
 
 def _grabber_for(name: str) -> Tuple[str, FrameGrabber]:
@@ -380,6 +549,10 @@ def mjpeg_generator(source: FrameGrabber, preview_fps: float):
             if frame is None:
                 time.sleep(0.05)
                 continue
+
+            # Apply local preview adjustments to the thermal feed so UI sliders have visible impact
+            if source is thermal:
+                frame = _apply_thermal_adjustments(frame)
 
             ok, jpg = cv2.imencode(
                 '.jpg', frame,
@@ -807,6 +980,9 @@ INDEX_HTML = """
   button:active { transform: translateY(0); }
   button.primary { background: linear-gradient(135deg, #3ba0ff, #4bc9ff); color: #08111c; border: none; }
   button.destructive { border-color: rgba(255,107,107,0.4); color: var(--danger); }
+  .record-toggle.recording { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.5); color: #fca5a5; }
+  /* Hide any legacy record start/stop buttons if they linger in the DOM */
+  [data-action="record-start"], [data-action="record-stop"] { display: none !important; }
   .palette-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   select, input[type="text"] {
     background: var(--panel);
@@ -816,7 +992,7 @@ INDEX_HTML = """
     padding: 8px 10px;
     min-width: 140px;
   }
-  .log { margin-top: 8px; font-size: 12px; color: var(--muted); white-space: pre-line; }
+  .log { margin-top: 8px; font-size: 12px; color: var(--muted); white-space: pre-line; word-break: break-word; }
   .chip {
     display: inline-flex;
     align-items: center;
@@ -909,8 +1085,13 @@ INDEX_HTML = """
     pointer-events: none;
   }
   .card[draggable="true"] {
-    cursor: grab;
     transition: opacity 150ms ease;
+  }
+  .card[draggable="true"] header {
+    cursor: grab;
+  }
+  .card[draggable="true"] header:active {
+    cursor: grabbing;
   }
   .card[draggable="true"]:hover {
     opacity: 0.85;
@@ -923,6 +1104,12 @@ INDEX_HTML = """
     border-color: var(--accent);
     box-shadow: 0 0 0 2px rgba(255, 138, 59, 0.2);
   }
+  .header-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
 
 </style>
 <body>
@@ -931,18 +1118,18 @@ INDEX_HTML = """
       <h1 style="margin:0;">Project Sauron</h1>
       <p class="subtitle" style="margin:4px 0 0;"></p>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap; margin-left:auto;">
       <div style="display:flex;align-items:center;gap:4px;">
         <span id="network-quality" style="font-size:12px;color:var(--muted);padding:4px 8px;border-radius:6px;background:rgba(255,255,255,0.05);">--</span>
         <span id="network-stats" style="font-size:11px;color:var(--muted);" title="Bandwidth / Latency"></span>
       </div>
-      <div style="height:20px;width:1px;background:rgba(255,255,255,0.1);"></div>
-      <label style="font-size:12px;color:var(--muted);white-space:nowrap;">FPS:</label>
-      <input type="range" id="fps-slider" min="1" max="60" value="10" style="width:100px;cursor:pointer;">
-      <span id="fps-display" style="font-size:12px;color:var(--text);min-width:30px;text-align:right;">10</span>
-      <button id="auto-fps-btn" style="background:rgba(100,200,255,0.2);border:1px solid #64c8ff;color:#64c8ff;padding:6px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:600;">Auto FPS</button>
+      <div class="header-actions" style="display:flex;align-items:center;gap:8px;">
+        <label style="font-size:12px;color:var(--muted);white-space:nowrap;">FPS:</label>
+        <input type="range" id="fps-slider" min="1" max="60" value="10" style="width:100px;cursor:pointer;">
+        <span id="fps-display" style="font-size:12px;color:var(--text);min-width:30px;text-align:right;">10</span>
+        <button id="auto-fps-btn" style="background:rgba(100,200,255,0.2);border:1px solid #64c8ff;color:#64c8ff;padding:6px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:600;">Auto FPS</button>
+      </div>
     </div>
-    <button id="swap-feeds" style="background:linear-gradient(135deg, #ff8a3b, #ffb347); color:#0b0d12; border:none; padding:10px 14px; border-radius:10px; font-weight:700;">Swap feeds</button>
   </header>
   <div class="grid">
     <section class="card" id="card-rgb" draggable="true" data-camera="rgb">
@@ -954,10 +1141,11 @@ INDEX_HTML = """
         <img id="preview-rgb" alt="RGB preview"/>
       </div>
       <div class="controls">
-        <button class="primary" data-camera="rgb" data-action="start">Start</button>
-        <button data-camera="rgb" data-action="stop" class="destructive">Stop</button>
+        <button class="record-toggle" data-record-camera="rgb" data-recording="false">Start Recording</button>
+        <button data-camera="rgb" data-action="photo">Photo</button>
         <button data-camera="rgb" data-action="reconnect">Reconnect</button>
       </div>
+      <div class="log" id="log-rgb" style="margin-top:8px;"></div>
     </section>
 
     <section class="card" id="card-thermal" draggable="true" data-camera="thermal">
@@ -969,13 +1157,14 @@ INDEX_HTML = """
         <img id="preview-thermal" alt="Thermal preview"/>
       </div>
       <div class="controls">
-        <button class="primary" data-camera="thermal" data-action="start">Start</button>
-        <button data-camera="thermal" data-action="stop" class="destructive">Stop</button>
+        <button class="record-toggle" data-record-camera="thermal" data-recording="false">Start Recording</button>
+        <button data-camera="thermal" data-action="photo">Photo</button>
         <button data-camera="thermal" data-action="reconnect">Reconnect</button>
       </div>
 
       <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
         <h3 style="margin: 0 0 12px; font-size: 13px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: 0.05em;">Imaging</h3>
+        <p class="subtitle" style="margin: -4px 0 10px; color: var(--muted);">Image controls</p>
         
         <div style="display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;">
           <select id="palette-select" aria-label="Palette" style="flex: 1; min-width: 120px;">
@@ -1031,11 +1220,12 @@ INDEX_HTML = """
           <div style="margin-top: 12px;">
             <label style="display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px;">Auto Shutter Mode</label>
             <div style="display: flex; gap: 4px;">
-              <button data-shutter="0" style="flex: 1; min-width: 40px;">Mode 0</button>
-              <button data-shutter="1" style="flex: 1; min-width: 40px;">Mode 1</button>
-              <button data-shutter="2" style="flex: 1; min-width: 40px;">Mode 2</button>
-              <button data-shutter="3" style="flex: 1; min-width: 40px;">Mode 3</button>
+              <button data-shutter="0" style="flex: 1; min-width: 40px;" title="Balanced auto shutter (default). Good general-purpose choice.">Mode 0</button>
+              <button data-shutter="1" style="flex: 1; min-width: 40px;" title="Faster shutter updates; better for motion, may add noise.">Mode 1</button>
+              <button data-shutter="2" style="flex: 1; min-width: 40px;" title="Aggressive noise control; slower updates, better stability.">Mode 2</button>
+              <button data-shutter="3" style="flex: 1; min-width: 40px;" title="Minimal auto shutter; holds exposure longer, risk of ghosting.">Mode 3</button>
             </div>
+            <p class="subtitle" style="margin:6px 0 0; color: var(--muted); font-size: 11px;">Mode 0: balanced (default) • 1: quicker updates, more noise • 2: smoother/less noise, slower • 3: holds exposure longer, may blur.</p>
           </div>
           <div style="display: flex; gap: 8px; margin-top: 12px;">
             <button id="save-settings" style="flex: 1; background: rgba(34, 197, 94, 0.2); color: #86efac; border-color: rgba(34, 197, 94, 0.3);">Save Settings</button>
@@ -1078,13 +1268,30 @@ INDEX_HTML = """
     const grid = document.querySelector(".grid");
 
     cards.forEach(card => {
+      let dragEnabled = false;
+      const handle = card.querySelector("header");
+
+      card.addEventListener("pointerdown", (e) => {
+        // Only arm dragging when the grab starts from the header
+        dragEnabled = !!(handle && handle.contains(e.target));
+      });
+
+      ["pointerup", "pointercancel"].forEach(evt => {
+        card.addEventListener(evt, () => { dragEnabled = false; }, { passive: true });
+      });
+
       card.addEventListener("dragstart", (e) => {
+        if (!dragEnabled) {
+          e.preventDefault();
+          return;
+        }
         draggedCard = card;
         card.classList.add("dragging");
         e.dataTransfer.effectAllowed = "move";
       });
 
       card.addEventListener("dragend", (e) => {
+        dragEnabled = false;
         card.classList.remove("dragging");
         cards.forEach(c => c.classList.remove("drag-over"));
         draggedCard = null;
@@ -1195,6 +1402,121 @@ INDEX_HTML = """
       }
     }
 
+    async function capturePhoto(camera) {
+      try {
+        const res = await fetch(`/api/camera/${camera}/photo`);
+        if (!res.ok) {
+          // Response might be JSON on error; fall back to status text otherwise
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(errJson.error || res.statusText || "Photo capture failed");
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const fileName = `${camera || "camera"}_photo_${timestamp}.jpg`;
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Photo capture failed");
+      }
+    }
+
+    const recordingState = { rgb: false, thermal: false };
+    function setRecordState(camera, isRecording) {
+      recordingState[camera] = !!isRecording;
+      const btn = document.querySelector(`.record-toggle[data-record-camera="${camera}"]`);
+      if (btn) {
+        btn.dataset.recording = String(isRecording);
+        btn.textContent = isRecording ? "Stop Recording" : "Start Recording";
+        btn.classList.toggle("recording", isRecording);
+      }
+    }
+
+    async function recordAction(camera, action) {
+      const logEl = document.getElementById(`log-${camera}`) || document.getElementById("palette-log");
+      const isStart = action === "record-start";
+      const message = isStart ? "Starting recording..." : "Stopping recording...";
+      if (logEl) logEl.textContent = message;
+      try {
+        const res = await fetch(`/api/camera/${camera}/record/${action === "record-start" ? "start" : "stop"}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fps: Number(fpsSlider?.value) || 10 })
+        });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error || "Recording request failed");
+        const statusMsg = json.running
+          ? `Recording... Saving to ${json.filename || json.path || "(unknown)"}.`
+          : `Recording stopped. File: ${json.filename || "(unknown)"}.`;
+        if (logEl) {
+          logEl.textContent = statusMsg;
+          logEl.title = json.path || "";
+        }
+        setRecordState(camera, !!json.running);
+        // Keep live preview running
+        setPreview(camera, true);
+        // Download to local machine after stop
+        if (!json.running && json.filename) {
+          downloadVideo(json.filename);
+        }
+      } catch (err) {
+        console.error(err);
+        if (logEl) logEl.textContent = err.message || "Recording failed";
+        alert(err.message || "Recording failed");
+        setRecordState(camera, false);
+      }
+    }
+
+    async function downloadVideo(filename) {
+      try {
+        const res = await fetch(`/media/video/${encodeURIComponent(filename)}`);
+        if (!res.ok) throw new Error("Failed to download video");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename || "recording.mp4";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Video download failed");
+      }
+    }
+
+    function applyImagingDefaults(defaults) {
+      if (!defaults) return;
+      const setSlider = (id, labelId, value) => {
+        const el = document.getElementById(id);
+        const label = document.getElementById(labelId);
+        if (typeof value !== "undefined") {
+          if (el) el.value = value;
+          if (label) label.textContent = value;
+        }
+      };
+      setSlider("brightness-slider", "brightness-value", defaults.brightness);
+      setSlider("contrast-slider", "contrast-value", defaults.contrast);
+      setSlider("static-denoise-slider", "static-denoise-value", defaults.static_denoise);
+      setSlider("dynamic-denoise-slider", "dynamic-denoise-value", defaults.dynamic_denoise);
+
+      if (typeof defaults.auto_shutter !== "undefined") {
+        document.querySelectorAll("[data-shutter]").forEach(btn => {
+          const active = Number(btn.dataset.shutter) === Number(defaults.auto_shutter);
+          btn.classList.toggle("primary", active);
+        });
+      }
+    }
+
     function populatePalettes(options) {
       const select = document.getElementById("palette-select");
       if (!select) return;
@@ -1292,8 +1614,22 @@ INDEX_HTML = """
       btn.addEventListener("click", () => {
         const camera = btn.dataset.camera;
         const action = btn.dataset.action;
-        cameraAction(camera, action);
+        if (action === "photo") {
+          capturePhoto(camera);
+        } else {
+          cameraAction(camera, action);
+        }
       });
+    });
+
+    document.querySelectorAll(".record-toggle").forEach(btn => {
+      const camera = btn.dataset.recordCamera;
+      if (!camera) return;
+      btn.addEventListener("click", () => {
+        const isRecording = recordingState[camera];
+        recordAction(camera, isRecording ? "record-stop" : "record-start");
+      });
+      setRecordState(camera, false);
     });
 
     document.getElementById("apply-palette").addEventListener("click", async () => {
@@ -1387,41 +1723,6 @@ INDEX_HTML = """
       });
     });
 
-    // Add a guard to prevent overlapping swaps.
-    let swapInProgress = false;
-
-    document.getElementById("swap-feeds").addEventListener("click", () => {
-      if (swapInProgress) return;
-      swapInProgress = true;
-
-      const rgbRunning = document.getElementById("status-rgb")?.classList.contains("running");
-      const thermalRunning = document.getElementById("status-thermal")?.classList.contains("running");
-
-      // Pause current previews while swap happens server-side
-      setPreview("rgb", false);
-      setPreview("thermal", false);
-
-      fetch("/api/camera/swap", { method: "POST" })
-        .then(async res => {
-          const json = await res.json();
-          if (!res.ok) throw new Error(json.error || "Swap failed");
-          // After swap, reset stream endpoints to defaults
-          streamEndpoints = { ...baseStreamEndpoints };
-          if (rgbRunning) setPreview("rgb", true);
-          if (thermalRunning) setPreview("thermal", true);
-        })
-        .catch(err => {
-          alert(err.message || "Swap failed");
-        })
-        .finally(() => {
-          swapInProgress = false;
-          // Hide the swap button after successful swap
-          document.getElementById("swap-feeds").style.display = "none";
-          // refresh statuses so UI matches server state
-          syncStatus();
-        });
-    });
-
     // FPS Control Slider
     const fpsSlider = document.getElementById("fps-slider");
     const fpsDisplay = document.getElementById("fps-display");
@@ -1441,6 +1742,20 @@ INDEX_HTML = """
       const fps = parseInt(e.target.value);
       fpsDisplay.textContent = fps;
       try {
+        // Manual adjustment disables Auto FPS
+        if (autoFpsActive) {
+          try {
+            await fetch("/api/auto-fps", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ enable: false })
+            });
+          } catch (err) {
+            console.warn("Failed to disable auto FPS on manual drag", err);
+          }
+          applyAutoFpsUI(false);
+        }
+
         const res = await fetch("/api/fps", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1458,13 +1773,42 @@ INDEX_HTML = """
     });
 
     // Auto FPS button and Network monitoring
-    const autoFpsBtn = document.getElementById("auto-fps-btn");
-    const networkQuality = document.getElementById("network-quality");
-    const networkStats = document.getElementById("network-stats");
-    let autoFpsActive = false;
-    function setFpsDisplayColor(isAuto) {
-      fpsDisplay.style.color = isAuto ? autoFpsColor : fpsDisplayBaseColor;
+  const autoFpsBtn = document.getElementById("auto-fps-btn");
+  const networkQuality = document.getElementById("network-quality");
+  const networkStats = document.getElementById("network-stats");
+  let autoFpsActive = false;
+  let recordStatusPoll;
+  function setFpsDisplayColor(isAuto) {
+    fpsDisplay.style.color = isAuto ? autoFpsColor : fpsDisplayBaseColor;
+  }
+
+  function applyAutoFpsUI(isOn, fpsValue) {
+    autoFpsActive = !!isOn;
+    if (autoFpsActive) {
+      if (Number.isFinite(fpsValue)) {
+        fpsSlider.value = fpsValue;
+        fpsDisplay.textContent = Math.round(fpsValue);
+      }
+      autoFpsBtn.style.background = 'rgba(74, 222, 128, 0.3)';
+      autoFpsBtn.style.borderColor = '#4ade80';
+      autoFpsBtn.style.color = '#4ade80';
+      autoFpsBtn.textContent = 'Auto FPS ON';
+      setFpsDisplayColor(true);
+      updateNetworkStats();
+      const interval = setInterval(updateNetworkStats, 3000);
+      autoFpsBtn._interval = interval;
+    } else {
+      autoFpsBtn.style.background = 'rgba(100, 200, 255, 0.2)';
+      autoFpsBtn.style.borderColor = '#64c8ff';
+      autoFpsBtn.style.color = '#64c8ff';
+      autoFpsBtn.textContent = 'Auto FPS';
+      setFpsDisplayColor(false);
+      if (autoFpsBtn._interval) {
+        clearInterval(autoFpsBtn._interval);
+      }
+      autoFpsBtn._interval = null;
     }
+  }
 
     async function updateNetworkStats() {
       try {
@@ -1519,34 +1863,8 @@ INDEX_HTML = """
         });
         
         const data = await res.json();
-        autoFpsActive = data.auto_fps_enabled;
         const autoFpsFromServer = Number(data.fps);
-        
-        if (autoFpsActive) {
-          if (Number.isFinite(autoFpsFromServer)) {
-            fpsSlider.value = autoFpsFromServer;
-            fpsDisplay.textContent = Math.round(autoFpsFromServer);
-          }
-          autoFpsBtn.style.background = 'rgba(74, 222, 128, 0.3)';
-          autoFpsBtn.style.borderColor = '#4ade80';
-          autoFpsBtn.style.color = '#4ade80';
-          autoFpsBtn.textContent = 'Auto FPS ON';
-          setFpsDisplayColor(true);
-          // Update network stats more frequently when auto FPS is on
-          updateNetworkStats();
-          const interval = setInterval(updateNetworkStats, 3000);
-          autoFpsBtn._interval = interval;
-        } else {
-          autoFpsBtn.style.background = 'rgba(100, 200, 255, 0.2)';
-          autoFpsBtn.style.borderColor = '#64c8ff';
-          autoFpsBtn.style.color = '#64c8ff';
-          autoFpsBtn.textContent = 'Auto FPS';
-          setFpsDisplayColor(false);
-          if (autoFpsBtn._interval) {
-            clearInterval(autoFpsBtn._interval);
-          }
-          autoFpsBtn._interval = null;
-        }
+        applyAutoFpsUI(data.auto_fps_enabled, autoFpsFromServer);
       } catch (err) {
         console.error("Auto FPS error:", err);
       }
@@ -1556,6 +1874,20 @@ INDEX_HTML = """
     updateNetworkStats();
     // Periodic network stats update every 5 seconds
     setInterval(updateNetworkStats, 5000);
+    // Periodic recording status sync to recover from stale UI without refresh
+    if (recordStatusPoll) clearInterval(recordStatusPoll);
+    recordStatusPoll = setInterval(async () => {
+      for (const cam of ["rgb", "thermal"]) {
+        try {
+          const res = await fetch(`/api/camera/${cam}/record/status`);
+          if (!res.ok) continue;
+          const data = await res.json();
+          setRecordState(cam, !!data.running);
+        } catch (e) {
+          // ignore poll errors
+        }
+      }
+    }, 8000);
 
     // Placeholder for SCD41; fill from a future endpoint if desired
     async function syncSensor() {
@@ -1766,12 +2098,13 @@ INDEX_HTML = """
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
         });
+        const json = await res.json();
         if (!res.ok) {
-          const json = await res.json();
           throw new Error(json.error || "Failed to reset factory settings");
         }
         const logEl = document.getElementById("palette-log");
         logEl.textContent = "✓ Factory reset completed. Device may need to restart.";
+        applyImagingDefaults(json.defaults);
       } catch (err) {
         console.error("Factory reset error:", err);
         alert(err.message || "Failed to reset factory settings");
@@ -1952,6 +2285,122 @@ def api_camera_stop(name):
 def api_camera_reconnect(name):
     return _camera_action(name, "reconnect")
 
+
+def _recorder_for(name: str) -> Tuple[str, VideoRecorder]:
+    lower = name.lower()
+    if lower not in recorders:
+        raise ValueError(f"Unknown camera '{name}'")
+    return lower, recorders[lower]
+
+
+def _save_media_bytes(kind: str, camera: str, data: bytes, ext: str) -> Path:
+    """
+    Persist media to the per-flight session folder.
+    kind: "photo" or "video"
+    """
+    target_dir = FLIGHT_PHOTOS_DIR if kind == "photo" else FLIGHT_VIDEOS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{camera}_{kind}_{stamp}.{ext.lstrip('.')}"
+    path = target_dir / filename
+    with path.open("wb") as fh:
+        fh.write(data)
+    logger.info(f"[MEDIA] Saved {kind} for {camera} -> {path}")
+    return path
+
+
+@app.route("/api/camera/<name>/photo", methods=["GET"])
+def api_camera_photo(name):
+    """Return the latest frame from the requested camera as a JPEG download."""
+    try:
+        cam_name, grabber = _grabber_for(name)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+    frame = grabber.read_latest()
+    if frame is None:
+        return jsonify({"error": "no frame available"}), 404
+
+    ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    if not ok:
+        return jsonify({"error": "failed to encode frame"}), 500
+
+    saved_path = _save_media_bytes("photo", cam_name, jpg.tobytes(), "jpg")
+    filename = f"{cam_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+    return Response(
+        jpg.tobytes(),
+        mimetype="image/jpeg",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "X-Saved-Path": str(saved_path),
+        },
+    )
+
+@app.route("/api/camera/<name>/record/start", methods=["POST"])
+def api_camera_record_start(name):
+    payload = request.get_json(force=True, silent=True) or {}
+    fps = float(payload.get("fps") or current_fps or FPS)
+    try:
+        cam_name, recorder = _recorder_for(name)
+        # Ensure camera is running so frames are available
+        grabber_name, grabber = _grabber_for(cam_name)
+        if not grabber.running:
+            grabber.start()
+        path = recorder.start(fps=fps)
+        return jsonify({
+            "camera": cam_name,
+            "running": recorder.running,
+            "path": str(path),
+            "filename": path.name,
+            "download_url": f"/media/video/{path.name}"
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/camera/<name>/record/stop", methods=["POST"])
+def api_camera_record_stop(name):
+    try:
+        cam_name, recorder = _recorder_for(name)
+        recorder.stop()
+        # Do NOT stop the grabber; keep live preview flowing
+        status = recorder.status()
+        filename = status.get("filename")
+        download_url = f"/media/video/{filename}" if filename else None
+        return jsonify({
+            "camera": cam_name,
+            "running": recorder.running,
+            "path": status.get("path"),
+            "filename": filename,
+            "download_url": download_url
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/camera/<name>/record/status", methods=["GET"])
+def api_camera_record_status(name):
+    try:
+        cam_name, recorder = _recorder_for(name)
+        status = recorder.status()
+        filename = status.get("filename")
+        download_url = f"/media/video/{filename}" if filename else None
+        return jsonify({"camera": cam_name, **status, "download_url": download_url})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/media/video/<path:filename>", methods=["GET"])
+def api_media_video(filename):
+    """Serve recorded video files from the session directory."""
+    base = FLIGHT_VIDEOS_DIR.resolve()
+    target = (FLIGHT_VIDEOS_DIR / filename).resolve()
+    if not str(target).startswith(str(base)):
+        abort(403)
+    if not target.exists():
+        abort(404)
+    return send_file(target, as_attachment=True, download_name=target.name, mimetype="video/mp4")
+
 @app.route("/api/camera/swap", methods=["POST"])
 def api_camera_swap():
     try:
@@ -2035,6 +2484,7 @@ def api_thermal_detail_high():
     payload = request.get_json(force=True, silent=True) or {}
     port_override = payload.get("port")
     try:
+        thermal_adjust_state["detail"] = 1.4
         result = set_detail_enhance(80, str(port_override) if port_override else None)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -2046,6 +2496,7 @@ def api_thermal_detail_low():
     payload = request.get_json(force=True, silent=True) or {}
     port_override = payload.get("port")
     try:
+        thermal_adjust_state["detail"] = 0.8
         result = set_detail_enhance(20, str(port_override) if port_override else None)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -2075,6 +2526,7 @@ def api_thermal_brightness_set():
     if value is None:
         return jsonify({"error": "value is required"}), 400
     try:
+        thermal_adjust_state["brightness"] = int(value)
         result = set_u8_setting(CLASS_ADDR_IMAGE, SUBCLASS_ADDR_BRIGHTNESS, int(value), str(port_override) if port_override else None)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -2089,6 +2541,7 @@ def api_thermal_contrast_set():
     if value is None:
         return jsonify({"error": "value is required"}), 400
     try:
+        thermal_adjust_state["contrast"] = int(value)
         result = set_u8_setting(CLASS_ADDR_IMAGE, SUBCLASS_ADDR_CONTRAST, int(value), str(port_override) if port_override else None)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -2142,7 +2595,21 @@ def api_thermal_factory_reset():
     port_override = request.get_json(force=True, silent=True) or {}
     try:
         result = factory_reset(str(port_override.get("port")) if port_override.get("port") else None)
-        return jsonify({"success": result.get("success"), "message": "Factory reset initiated"})
+        # Reset local software state to defaults for preview
+        _reset_imaging_state_to_defaults()
+        defaults = {
+          "brightness": DEFAULT_IMAGING["brightness"],
+          "contrast": DEFAULT_IMAGING["contrast"],
+          "static_denoise": DEFAULT_IMAGING["static_denoise"],
+          "dynamic_denoise": DEFAULT_IMAGING["dynamic_denoise"],
+          "detail": DEFAULT_IMAGING["detail"],
+          "auto_shutter": DEFAULT_IMAGING["auto_shutter"],
+        }
+        return jsonify({
+            "success": result.get("success"),
+            "message": "Factory reset initiated",
+            "defaults": defaults
+        })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
